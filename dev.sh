@@ -11,6 +11,8 @@
 #   ./dev.sh push       push the existing .snplg
 #   ./dev.sh log nomad  stream logs from the Nomad
 #   ./dev.sh log manta  stream logs from the Manta
+#
+# VERSION_NAME=1.0.0 ./dev.sh build   names a release build (versionCode still bumps)
 
 set -euo pipefail
 
@@ -48,8 +50,10 @@ with open(p) as f:
     cfg = json.load(f)
 code = int(cfg.get("versionCode", "0") or 0) + 1
 cfg["versionCode"] = str(code)
-# Keep versionName in step so the device UI shows something distinguishable.
-cfg["versionName"] = f"0.0.{code}"
+# Keep versionName in step so the device UI shows something distinguishable,
+# unless a release name is given.
+import os
+cfg["versionName"] = os.environ.get("VERSION_NAME") or f"0.0.{code}"
 with open(p, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")

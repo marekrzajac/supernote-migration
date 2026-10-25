@@ -25,7 +25,8 @@ comes along.
 
 ## Using it
 
-1. Install `Migration.snplg`: copy it to your device, then go to **Settings → Apps → Plugins →
+1. [**Download `Migration.snplg`**](https://github.com/marekrzajac/supernote-migration/releases/latest/download/Migration.snplg)
+   and copy it to your device, then go to **Settings → Apps → Plugins →
    Add Plugin**. Allow the file permissions it asks for. Choose **Always allow**, or it will ask
    every time.
 2. Open a note, tap the **Plugins** button in the sidebar, then choose **Migration**.
