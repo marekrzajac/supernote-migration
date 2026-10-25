@@ -71,6 +71,14 @@ const OLD_WORK_DIRS = [
 const PLAIN = 'style_white';
 
 /**
+ * Is this a blank white template? Besides style_white the firmware reports
+ * device- and orientation-specific names, e.g. style_h_white_a5x2 on a Manta
+ * landscape page (v0.0.55 rendered and kept one). Blank pages need no
+ * background.
+ */
+const isPlain = (name: string | undefined) => !name || /^style_(h_)?white(_|$)/.test(name);
+
+/**
  * Per-page stroke summaries (thickness, stored geometry, pen data, picture
  * tags) for the original and the translation, logged with every report. They
  * re-read both notes, so they're off for normal use.
@@ -344,6 +352,17 @@ async function pageSize(path: string, page: number): Promise<Size> {
 }
 
 /**
+ * Migration's own working files (EXPORT/Migration/, apart from backups) are
+ * never translated or set up. The temporary note can reach the other device
+ * through sync and be opened there; translating it deleted it as a leftover
+ * (v0.0.55, safely stopped — it was only a copy).
+ */
+const isWorkingFile = (path: string) =>
+  [WORK_DIR, ...OLD_WORK_DIRS].some(d => path.startsWith(`${d}/`)) &&
+  !path.startsWith(`${BACKUP_DIR}/`);
+const OWN_FILE = "This is Migration's temporary copy, not one of your notes. Nothing was changed.";
+
+/**
  * Work out which way to translate, from what this device is and what the open
  * note is. Returns undefined (with an explanation in the report) if neither
  * direction applies here.
@@ -367,6 +386,10 @@ export async function planTranslation(
   }
 
   report.add('note', srcPath);
+  if (isWorkingFile(srcPath)) {
+    report.add('nothing to do', OWN_FILE, true);
+    return undefined;
+  }
   report.add('pages', String(srcPages));
   report.add('page size', `${srcSize.width} x ${srcSize.height}`);
   const device = await detectDevice(report);
@@ -607,6 +630,14 @@ async function makePicture(path: string, rect: Rect): Promise<any> {
 }
 
 /**
+ * Kept images of built-in templates, one per template, named after it
+ * (style_5mm_grid.png). Set up new pages needs them: a plugin can't copy a
+ * picture out of a note, and a Manta page can't draw a built-in template at
+ * Nomad scale (see setUpNewPages).
+ */
+const TEMPLATE_DIR = `${WORK_DIR}/templates`;
+
+/**
  * Rendered template images made during the current translation. They only
  * need to exist while the background is inserted: the editor copies a
  * picture's image INTO the note on insert (reading it back yields a temporary
@@ -618,10 +649,10 @@ const renders = new Map<string, string>();
  * The background image for a template, for inserting as a page background.
  *
  * A custom template IS a PNG in MyStyle/ — used directly, nothing created.
- * Built-in templates (style_*) live inside the system app, not as files, so
- * they — and a custom template missing on this device — are rendered once per
- * translation into the working folder, and removed after insertion by
- * clearRenders(). No template files are left behind either way.
+ * A built-in template (style_*) isn't a file, so it's rendered from the Nomad
+ * page into TEMPLATE_DIR — once ever: an existing image is reused, and it's
+ * kept for Set up new pages. A custom template missing on this device is
+ * rendered just for this translation and removed by clearRenders().
  */
 async function templateImage(
   srcPath: string,
@@ -634,12 +665,16 @@ async function templateImage(
       return mine;
     }
   }
-  const done = renders.get(tpl.name);
-  if (done) {
+  const builtIn = tpl.name.startsWith('style_');
+  const done = builtIn ? `${TEMPLATE_DIR}/${tpl.name}.png` : renders.get(tpl.name);
+  if (done && (await exists(done))) {
     return done;
   }
-  const path = `${WORK_DIR}/rendering-${renders.size}.png`;
+  const path = builtIn ? done! : `${WORK_DIR}/rendering-${renders.size}.png`;
   await FileUtils.makeDir(WORK_DIR).catch(() => false);
+  if (builtIn) {
+    await FileUtils.makeDir(TEMPLATE_DIR).catch(() => false);
+  }
   unwrap(
     await PluginFileAPI.generateNoteTemplatePng(srcPath, page, path),
     'generateNoteTemplatePng',
@@ -647,7 +682,9 @@ async function templateImage(
   if (!(await exists(path))) {
     throw new Error('could not render the template image');
   }
-  renders.set(tpl.name, path);
+  if (!builtIn) {
+    renders.set(tpl.name, path);
+  }
   return path;
 }
 
@@ -1126,6 +1163,27 @@ function reportTotals(report: Report, t: Totals, extra: number) {
   report.add('failed', String(extra + t.failed), extra + t.failed > 0);
 }
 
+/** The page outlines and fold for a Manta page; the first carries `firstTag`. */
+async function outlineElements(L: Layout, firstTag: string): Promise<any[]> {
+  const out: any[] = [];
+  const segs = outlineSegments(L);
+  for (let i = 0; i < segs.length; i++) {
+    const [a, z] = segs[i];
+    const el: any = unwrap(await PluginCommAPI.createElement(Element.TYPE_GEO), 'createElement(GEO)');
+    el.layerNum = 0;
+    el.userData = i === 0 ? firstTag : OUTLINE_USERDATA;
+    el.geometry = {
+      penColor: OUTLINE_PEN_COLOR,
+      penType: OUTLINE_PEN_TYPE,
+      penWidth: OUTLINE_PEN_WIDTH,
+      type: 'straightLine',
+      points: [a, z],
+    };
+    out.push(el);
+  }
+  return out;
+}
+
 /**
  * Nomad note -> Manta note. Runs on the Manta.
  * `portrait` picks the layout: false = side by side (landscape), true = stacked.
@@ -1186,7 +1244,7 @@ async function toManta(
         await PluginFileAPI.getNotePageTemplate(srcPath, k),
         'getNotePageTemplate',
       );
-      if (tpl?.name && tpl.name !== PLAIN) {
+      if (!isPlain(tpl?.name)) {
         const bg = await templateImage(srcPath, k, tpl);
         const pic = await makePicture(
           bg,
@@ -1240,25 +1298,8 @@ async function toManta(
 
   // Page outlines and the fold/divider on every output page. The first one
   // also remembers which half each keyword came from.
-  const segs = outlineSegments(L);
   for (const b of batches) {
-    for (let i = 0; i < segs.length; i++) {
-      const [a, z] = segs[i];
-      const el: any = unwrap(
-        await PluginCommAPI.createElement(Element.TYPE_GEO),
-        'createElement(GEO)',
-      );
-      el.layerNum = 0;
-      el.userData = i === 0 ? outlineTag(b.keywords) : OUTLINE_USERDATA;
-      el.geometry = {
-        penColor: OUTLINE_PEN_COLOR,
-        penType: OUTLINE_PEN_TYPE,
-        penWidth: OUTLINE_PEN_WIDTH,
-        type: 'straightLine',
-        points: [a, z],
-      };
-      b.outlines.push(el);
-    }
+    b.outlines.push(...(await outlineElements(L, outlineTag(b.keywords))));
   }
 
   const t = await insertBatches(report, dstPath, batches);
@@ -1361,7 +1402,6 @@ async function toNomad(
   report.add('pages', `${outPages} (from ${srcPages} Manta pages)`);
 
   const batches: PageBatch[] = Array.from({length: outPages}, newBatch);
-  let missingImages = 0;
 
   // Same-note page links: back to the exact Nomad page if remembered, else the
   // first page of the pair.
@@ -1389,12 +1429,11 @@ async function toNomad(
     };
     try {
       if (it.el?.type === Element.TYPE_PICTURE) {
+        // No exists() check: getElements extracts the image to the note app's
+        // private /.data/plugin/, which FileUtils can't see (it said "missing" for
+        // images that were there, v0.0.50). If it really is missing, the insert
+        // fails and the translation stops without replacing the note.
         const path = it.el.picture.picturePath;
-        // A missing file would fail the whole page's picture insert (1211).
-        if (!(await FileUtils.exists(path).catch(() => false))) {
-          missingImages++;
-          continue;
-        }
         batches[target].pictures.push(await makePicture(path, M.rect(it.el.picture.rect)));
       } else if ((await collect(report, it.el, batches[target], it.page, M, it.pts, linkDest)) === 'failed') {
         failed++;
@@ -1415,7 +1454,6 @@ async function toNomad(
   }
 
   reportTotals(report, t, failed);
-  report.add('image files not on this device', String(missingImages), missingImages > 0);
   return failed + t.failed;
 }
 
@@ -1749,25 +1787,41 @@ const CARRIED = new Set<number>([
  */
 async function uncarried(plan: Plan): Promise<string | undefined> {
   const types = new Map<number, number>();
+  let pictures = 0;
   for (let p = 0; p < plan.srcPages; p++) {
     let els: any[] = [];
+    let L: Layout | undefined;
     try {
       els = await readElements(plan.srcPath, p);
+      const size = await pageSize(plan.srcPath, p);
+      L = isManta(size) ? planLayout(size, NOMAD_PAGE) : undefined;
     } catch {
       continue;
     }
     for (const el of els) {
-      if (!CARRIED.has(el?.type)) {
+      if (el?.type === Element.TYPE_PICTURE && !backgroundOf(el, L).is) {
+        pictures++;
+      } else if (!CARRIED.has(el?.type)) {
         types.set(el?.type, (types.get(el?.type) ?? 0) + 1);
       }
     }
     await recycleAll(els);
   }
   const n = [...types.values()].reduce((a, b) => a + b, 0);
-  if (!n) {
-    return undefined;
+  const parts: string[] = [];
+  if (pictures) {
+    // A plugin can't copy a picture: reading one extracts its image into the
+    // note app's private /.data/plugin/, and the SDK refuses to insert from
+    // there ([1211], v0.0.51). Before v0.0.52 the Nomad direction skipped them
+    // and replaced the note anyway.
+    parts.push(pictures === 1 ? 'a picture' : `${pictures} pictures`);
   }
-  return `${n === 1 ? 'an item' : `${n} items`} of a kind it doesn't know (type ${[...types.keys()].join(', ')})`;
+  if (n) {
+    parts.push(
+      `${n === 1 ? 'an item' : `${n} items`} of a kind it doesn't know (type ${[...types.keys()].join(', ')})`,
+    );
+  }
+  return parts.length ? parts.join(' and ') : undefined;
 }
 
 export async function runTranslation(
@@ -1951,6 +2005,247 @@ export async function reopen(path: string): Promise<string> {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Setting up pages added on the Manta
+// ---------------------------------------------------------------------------
+
+/** A page background found on a set-up page, for copying to a new one. */
+type Background = {template: string; tag: string; el: any};
+
+/**
+ * An image of a template that a plugin can insert, or undefined.
+ *
+ * Not the picture already in the note: getElements extracts it to the note
+ * app's private /.data/plugin/ (drwx------), and the SDK refuses to insert from
+ * there ([1211] "PNG file does not exist", v0.0.51). So the image comes from the
+ * template itself: a custom template is MyStyle/<name>.png; a built-in one only
+ * if a render of it has been kept in TEMPLATE_DIR.
+ */
+async function insertableTemplate(name: string): Promise<string | undefined> {
+  const path = name.startsWith('user_')
+    ? `${MYSTYLE}${name.slice('user_'.length)}.png`
+    : `${TEMPLATE_DIR}/${name}.png`;
+  return (await exists(path)) ? path : undefined;
+}
+
+/** Temporary files made by imageFromNote, removed once the pages are saved. */
+const copies: string[] = [];
+
+/**
+ * A readable PNG of a picture that's already in the note, made by the note app
+ * itself: the picture element becomes a sticker (convertElement2Sticker), and
+ * the sticker is rendered back out as a PNG (generateStickerThumbnail) into the
+ * working folder. Both run in the note app, which can read its own private
+ * image extractions. Every step is reported; undefined if any fails.
+ */
+async function imageFromNote(report: Report, el: any, label: string): Promise<string | undefined> {
+  const n = copies.length;
+  const sticker = `${WORK_DIR}/copying-${n}.sticker`;
+  const png = `${WORK_DIR}/copying-${n}.png`;
+  copies.push(sticker, png);
+  try {
+    await FileUtils.makeDir(WORK_DIR).catch(() => false);
+    unwrap(
+      await PluginCommAPI.convertElement2Sticker({machineType: 5, elements: [el], stickerPath: sticker}),
+      'convertElement2Sticker',
+    );
+    const size: any = unwrap(await PluginCommAPI.getStickerSize(sticker), 'getStickerSize');
+    report.add(`${label} sticker`, `${size?.width} x ${size?.height}`);
+    unwrap(
+      await PluginCommAPI.generateStickerThumbnail(sticker, png, {
+        width: NOMAD_PAGE.width,
+        height: NOMAD_PAGE.height,
+      }),
+      'generateStickerThumbnail',
+    );
+    if (!(await exists(png))) {
+      report.add(`${label} copy`, 'thumbnail not written', true);
+      return undefined;
+    }
+    return png;
+  } catch (e: any) {
+    report.add(`${label} copy`, e?.message ?? String(e), true);
+    return undefined;
+  }
+}
+
+/**
+ * Give pages added to a Manta note after its translation the two-page layout:
+ * each half gets the background of the same half of the page before it (or,
+ * for new pages at the start, the first set-up page after), plus the outline
+ * and fold. The template tags come along, so the page translates back to the
+ * Nomad with the right templates.
+ *
+ * Everything is added through the editor (insertPageElements on the open note,
+ * then saveCurrentNote), the way the same-note links are — no new file, no
+ * reopen, so page IDs and links are untouched. The note is saved first so the
+ * file reads match what's on screen.
+ *
+ * Returns the number of pages set up, or undefined if it stopped (the report
+ * says why).
+ */
+export async function setUpNewPages(
+  report: Report,
+  opts: {keepBackup: boolean},
+): Promise<number | undefined> {
+  report.heading('MIGRATE ADDED PAGES');
+  let path: string;
+  let pages: number;
+  try {
+    path = unwrap(await PluginCommAPI.getCurrentFilePath(), 'getCurrentFilePath');
+    unwrap(await PluginNoteAPI.saveCurrentNote(), 'saveCurrentNote');
+    pages = await totalPages(path);
+    if (!isManta(await pageSize(path, 0))) {
+      report.add('nothing to do', 'This is not a Manta note.', true);
+      return undefined;
+    }
+  } catch (e: any) {
+    report.add('ABORTED', e?.message ?? String(e), true);
+    return undefined;
+  }
+  report.add('note', path);
+  if (isWorkingFile(path)) {
+    report.add('nothing to do', OWN_FILE, true);
+    return undefined;
+  }
+
+  // Read every page: is it set up, and what are its backgrounds?
+  type PageInfo = {L: Layout; setUp: boolean; bgs: (Background | undefined)[]; els: any[]};
+  const info: PageInfo[] = [];
+  for (let j = 0; j < pages; j++) {
+    const L = planLayout(await pageSize(path, j), NOMAD_PAGE);
+    const els = await readElements(path, j).catch(() => [] as any[]);
+    const bgs: (Background | undefined)[] = [undefined, undefined];
+    for (const el of els) {
+      const bg = backgroundOf(el, L);
+      const r = el.picture?.rect;
+      if (bg.is && bg.template && r) {
+        const cx = (r.left + r.right) / 2;
+        const cy = (r.top + r.bottom) / 2;
+        const slot = L.vertical ? (cx < L.manta.width / 2 ? 0 : 1) : cy < L.manta.height / 2 ? 0 : 1;
+        bgs[slot] = {template: bg.template, tag: el.userData ?? '', el};
+      }
+    }
+    info.push({L, setUp: els.some(isOurOutline), bgs, els});
+  }
+
+  const todo = info.map((p, j) => (p.setUp ? -1 : j)).filter(j => j >= 0);
+  if (!todo.length) {
+    report.add('nothing to do', 'Every page already has the two-page layout.', true);
+    for (const p of info) {
+      await recycleAll(p.els);
+    }
+    return undefined;
+  }
+  report.add('pages to set up', todo.map(j => j + 1).join(', '));
+
+  if (opts.keepBackup) {
+    const {base} = baseName(path);
+    await FileUtils.makeDir(WORK_DIR).catch(() => false);
+    await FileUtils.makeDir(BACKUP_DIR).catch(() => false);
+    const backupPath = `${BACKUP_DIR}/${base} ${stamp()}.note`;
+    const ok = await FileUtils.copyFile(path, backupPath).catch(() => false);
+    if (!ok || !(await exists(backupPath))) {
+      report.add('NOT CHANGED', 'could not make the backup, so the note was left as it was', true);
+      for (const p of info) {
+        await recycleAll(p.els);
+      }
+      return undefined;
+    }
+    report.add('backup', backupPath);
+  } else {
+    report.add('backup', 'off');
+  }
+
+  let done = 0;
+  let failed = 0;
+  for (const j of todo) {
+    const {L} = info[j];
+    const els: any[] = [];
+    const sources: string[] = [];
+    for (const slot of [0, 1]) {
+      // Each half copies the nearest earlier page with a background on that
+      // side — or, for new pages at the very start, the nearest later one.
+      // Per half, so a half that was left plain (e.g. an earlier set-up that
+      // couldn't copy it) doesn't make the next page plain too (v0.0.53).
+      let from = -1;
+      for (let k = j - 1; k >= 0 && from < 0; k--) {
+        from = info[k].bgs[slot] ? k : -1;
+      }
+      for (let k = j + 1; k < pages && from < 0; k++) {
+        from = info[k].bgs[slot] ? k : -1;
+      }
+      const bg = from >= 0 ? info[from].bgs[slot] : undefined;
+      if (!bg) {
+        continue; // no page has a background on this side — leave it plain
+      }
+      sources.push(`half ${slot + 1} like page ${from + 1}`);
+      const image =
+        (await insertableTemplate(bg.template)) ??
+        (await imageFromNote(report, bg.el, `page ${j + 1} half ${slot + 1}`));
+      if (!image) {
+        report.add(
+          `page ${j + 1}`,
+          bg.template.startsWith('style_')
+            ? `half ${slot + 1}: no copy of ${bg.template} yet — outline only. ` +
+                `It's kept the next time a note using it is translated onto this Manta.`
+            : `half ${slot + 1}: ${bg.template} isn't in MyStyle on this device — outline only`,
+          true,
+        );
+        failed++;
+        continue;
+      }
+      const pic = await makePicture(
+        image,
+        rectToManta({left: 0, top: 0, right: L.nomad.width, bottom: L.nomad.height}, L, slot),
+      );
+      pic.userData = bg.tag;
+      els.push(pic);
+    }
+    const backgrounds = els.length;
+    const outlines = await outlineElements(L, OUTLINE_USERDATA);
+    els.push(...outlines);
+    try {
+      try {
+        unwrap(await PluginCommAPI.insertPageElements(els, j, 0), 'insertPageElements');
+      } catch (e: any) {
+        if (!backgrounds) {
+          throw e;
+        }
+        // The backgrounds couldn't be added: still give the page its outline.
+        report.add(`page ${j + 1} backgrounds`, e?.message ?? String(e), true);
+        failed++;
+        unwrap(await PluginCommAPI.insertPageElements(outlines, j, 0), 'insertPageElements');
+      }
+      done++;
+      report.add(
+        `page ${j + 1}`,
+        sources.length
+          ? `set up: ${sources.join(', ')} (${backgrounds} background${backgrounds === 1 ? '' : 's'} added)`
+          : 'outline only — no page with a background to copy from',
+      );
+    } catch (e: any) {
+      failed++;
+      report.add(`page ${j + 1}`, e?.message ?? String(e), true);
+    }
+    await recycleAll(els);
+  }
+  for (const p of info) {
+    await recycleAll(p.els);
+  }
+  try {
+    unwrap(await PluginNoteAPI.saveCurrentNote(), 'saveCurrentNote');
+  } catch (e: any) {
+    report.add('save', e?.message ?? String(e), true);
+  }
+  // The images are in the note now.
+  for (const f of copies.splice(0)) {
+    await FileUtils.deleteFile(f).catch(() => false);
+  }
+  report.add('pages set up', `${done}${failed ? `, ${failed} problems` : ''}`, failed > 0);
+  return failed ? undefined : done;
+}
 
 // ---------------------------------------------------------------------------
 // Settings

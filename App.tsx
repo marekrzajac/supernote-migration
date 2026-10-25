@@ -40,6 +40,7 @@ import {
   waitForOpen,
   hasSameNoteLinks,
   dropSameNoteLinks,
+  setUpNewPages,
   type Direction,
   type Format,
 } from './lib/translate';
@@ -47,7 +48,7 @@ import {
 const WHY = 'Translating reshapes the open note, replacing the file.';
 
 /** What the cover over the card is showing, if anything. */
-type Cover = {kind: 'busy'} | {kind: 'message'; text: string} | null;
+type Cover = {kind: 'busy'; text: string} | {kind: 'message'; text: string} | null;
 
 function App(): React.JSX.Element {
   const [format, setFormat] = useState<Format | undefined>();
@@ -92,7 +93,7 @@ function App(): React.JSX.Element {
       if (busy) {
         return;
       }
-      setCover({kind: 'busy'});
+      setCover({kind: 'busy', text: 'Translating…'});
 
       const report = new Report();
       report.heading('PERMISSIONS');
@@ -150,8 +151,36 @@ function App(): React.JSX.Element {
     [busy, keepBackup],
   );
 
+  /**
+   * Pages added to a Manta note after it was translated get the two-page
+   * layout of the page before them (see setUpNewPages).
+   */
+  const setUp = useCallback(async () => {
+    if (busy) {
+      return;
+    }
+    setCover({kind: 'busy', text: 'Migrating added pages…'});
+    const report = new Report();
+    report.heading('PERMISSIONS');
+    const ok =
+      (await ensurePermission(report, PERM_READ, 'FILE:READ', WHY)) &&
+      (await ensurePermission(report, PERM_WRITE, 'FILE:WRITE', WHY));
+    const done = ok ? await setUpNewPages(report, {keepBackup}) : undefined;
+    report.log('ADDED PAGES REPORT');
+    if (done !== undefined) {
+      setCover(null);
+      PluginManager.closePluginView();
+      return;
+    }
+    setCover({
+      kind: 'message',
+      text: ok ? lastProblem(report) ?? 'Nothing was changed.' : 'Permission denied — try again and choose "Always allow".',
+    });
+  }, [busy, keepBackup]);
+
   const canToManta = device === 'Manta' && format === 'Nomad';
   const canToNomad = device === 'Nomad' && format === 'Manta';
+  const canSetUp = device === 'Manta' && format === 'Manta';
 
   return (
     <Pressable style={styles.backdrop} onPress={close}>
@@ -175,6 +204,13 @@ function App(): React.JSX.Element {
           </Text>
         </Pressable>
 
+        <Pressable
+          style={[styles.button, !canSetUp && styles.disabled]}
+          disabled={!canSetUp || busy}
+          onPress={setUp}>
+          <Text style={styles.buttonText}>Migrate added pages</Text>
+        </Pressable>
+
         <Toggle
           label={`Backup before change?  ${keepBackup ? 'On' : 'Off'}`}
           on={keepBackup}
@@ -186,7 +222,7 @@ function App(): React.JSX.Element {
             style={styles.cover}
             onPress={() => (cover.kind === 'message' ? setCover(null) : undefined)}>
             <Text style={styles.coverText}>
-              {cover.kind === 'busy' ? 'Translating…' : cover.text}
+              {cover.text}
             </Text>
           </Pressable>
         ) : null}
