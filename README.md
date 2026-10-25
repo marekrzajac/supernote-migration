@@ -124,6 +124,5 @@ The code is in [`lib/translate.ts`](lib/translate.ts). In short:
 
 ## License
 
-Migration is free software, released under the
-[GNU General Public License v3.0](LICENSE). You're free to use, study, change and share it;
-if you share a modified version, it must stay open under the same license.
+Migration is free software, released under the [MIT License](LICENSE). You're free to use,
+change and share it; just keep the copyright notice with it.
