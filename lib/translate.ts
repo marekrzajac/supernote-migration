@@ -412,30 +412,46 @@ function stamp(): string {
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}${z(d.getMinutes())}`;
 }
 
-/** Grow a fresh note to `want` blank pages. Order is irrelevant: all are blank. */
+/**
+ * Grow a fresh note to `want` pages, page k with template `templateFor(k)`.
+ *
+ * The SDK doesn't say whether insertNotePage inserts before or after `page`,
+ * so both conventions are tried, appending at `have` first. With per-page
+ * templates the order matters; runTranslation reads every page's template
+ * back into the report so a misplaced page would show.
+ */
 async function ensurePages(
   report: Report,
   path: string,
   want: number,
-  template = PLAIN,
+  templateFor: (page: number) => string = () => PLAIN,
 ): Promise<boolean> {
   let have = await totalPages(path);
   while (have < want) {
     let grew = false;
-    for (const page of [have, have - 1]) {
-      try {
-        unwrap(
-          await PluginFileAPI.insertNotePage({notePath: path, page, template}),
-          'insertNotePage',
-        );
-        const now = await totalPages(path);
-        if (now > have) {
-          have = now;
-          grew = true;
-          break;
+    const wanted = templateFor(have);
+    for (const template of wanted === PLAIN ? [PLAIN] : [wanted, PLAIN]) {
+      for (const page of [have, have - 1]) {
+        try {
+          unwrap(
+            await PluginFileAPI.insertNotePage({notePath: path, page, template}),
+            'insertNotePage',
+          );
+          const now = await totalPages(path);
+          if (now > have) {
+            if (template !== wanted) {
+              report.add(`page ${have} template`, `${wanted} refused — plain`, true);
+            }
+            have = now;
+            grew = true;
+            break;
+          }
+        } catch {
+          // Try the other index convention, then plain.
         }
-      } catch {
-        // Try the other index convention.
+      }
+      if (grew) {
+        break;
       }
     }
     if (!grew) {
@@ -1495,37 +1511,59 @@ async function strokeStats(report: Report, label: string, path: string): Promise
  * pictures toManta left behind. One template for the whole note: that covers
  * the normal case, and differing pages are reported rather than guessed at.
  */
-async function nomadTemplate(report: Report, plan: Plan): Promise<string> {
-  const names = new Set<string>();
+/**
+ * The template for each Nomad page, from the background tags on the Manta
+ * pages: Nomad page 2j + slot gets the background in that slot of Manta page j.
+ * Pages without a known template are plain.
+ */
+async function nomadTemplates(report: Report, plan: Plan): Promise<string[]> {
+  const out: string[] = [];
+  const seen = new Map<string, string | undefined>();
   for (let j = 0; j < plan.srcPages; j++) {
     try {
+      const size = await pageSize(plan.srcPath, j);
+      const L = planLayout(size, NOMAD_PAGE);
       const els = await readElements(plan.srcPath, j);
       for (const el of els) {
-        const name = backgroundOf(el).template;
-        if (name) {
-          names.add(name);
+        const name = backgroundOf(el, L).template;
+        const r = el.picture?.rect;
+        if (!name || !r) {
+          continue;
         }
+        const cx = (r.left + r.right) / 2;
+        const cy = (r.top + r.bottom) / 2;
+        const slot = L.vertical ? (cx < L.manta.width / 2 ? 0 : 1) : cy < L.manta.height / 2 ? 0 : 1;
+        if (!seen.has(name)) {
+          seen.set(name, await resolveTemplate(name));
+        }
+        out[j * 2 + slot] = seen.get(name) ?? PLAIN;
       }
       await recycleAll(els);
     } catch {
       // A page we can't read just contributes nothing here.
     }
   }
-  const [first] = names;
-  const resolved = await resolveTemplate(first);
-  report.add(
-    'template',
-    !first
-      ? 'none recorded — plain'
-      : resolved
-      ? `${first} -> ${resolved}`
-      : `${first} not on this device — plain`,
-    !!first && !resolved,
-  );
-  if (names.size > 1) {
-    report.add('  note', `pages used ${names.size} templates; using the first for all`, true);
+  if (!seen.size) {
+    report.add('template', 'none recorded — plain');
   }
-  return resolved ?? PLAIN;
+  for (const [name, resolved] of seen) {
+    report.add('template', resolved ? `${name} -> ${resolved}` : `${name} not on this device — plain`, !resolved);
+  }
+  return Array.from({length: plan.srcPages * 2}, (_, k) => out[k] ?? PLAIN);
+}
+
+/** Each page's template as the note now records it, for the report. */
+async function reportPageTemplates(report: Report, path: string): Promise<void> {
+  const names: string[] = [];
+  const pages = await totalPages(path).catch(() => 0);
+  for (let p = 0; p < pages; p++) {
+    try {
+      names.push(unwrap(await PluginFileAPI.getNotePageTemplate(path, p), 'getNotePageTemplate')?.name ?? '?');
+    } catch {
+      names.push('?');
+    }
+  }
+  report.add('page templates', names.join(', '));
 }
 
 /**
@@ -1768,7 +1806,8 @@ export async function runTranslation(
 
     // Manta pages are built plain, with scaled background pictures per slot.
     // Nomad pages can use the real template natively at full size.
-    let template = toManta_ ? PLAIN : await nomadTemplate(report, plan);
+    const templates = toManta_ ? [] : await nomadTemplates(report, plan);
+    let template = templates[0] ?? PLAIN;
     const isPortrait = toManta_ ? !!opts.portrait : true;
     const create = async (path: string) => {
       try {
@@ -1796,11 +1835,16 @@ export async function runTranslation(
       await create(tempPath);
     }
     report.add('built in', tempPath);
-    const prepare = (want: number) => ensurePages(report, tempPath, want, template);
+    const prepare = (want: number) =>
+      ensurePages(report, tempPath, want, k => (k === 0 ? template : templates[k] ?? PLAIN));
 
     const failed = toManta_
       ? await toManta(report, plan, tempPath, prepare)
       : await toNomad(report, plan, tempPath, prepare);
+
+    if (!toManta_) {
+      await reportPageTemplates(report, tempPath);
+    }
 
     if (DIAGNOSTICS) {
       await strokeStats(report, 'original', plan.srcPath);

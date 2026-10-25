@@ -2,6 +2,8 @@
 
 *Nomad ↔ Manta*
 
+![Two Nomad pages, with dots and a grid, become one Manta landscape page side by side, and back again](docs/migration-before-after.png)
+
 A Supernote plugin that reshapes a note to fit whichever device you're holding.
 
 Write on the **Nomad** (A6 X2), and Migration turns each pair of pages into one **Manta** (A5 X2)
