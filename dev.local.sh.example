@@ -1,0 +1,3 @@
+# Copy to dev.local.sh and fill in your devices' adb serials (`adb devices`).
+NOMAD=SN0XXXXXXXXXXXX
+MANTA=SN1XXXXXXXXXXXX

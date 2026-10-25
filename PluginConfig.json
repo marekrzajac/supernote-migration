@@ -1,0 +1,15 @@
+{
+  "name": "Migration",
+  "desc": "Nomad \u2194 Manta \u2014 reshape notes between Nomad pages and Manta spreads",
+  "iconPath": "assets/icon.png",
+  "versionName": "0.0.46",
+  "versionCode": "46",
+  "pluginID": "kfzedf1p3517l5ni",
+  "pluginKey": "NomadManta",
+  "jsMainPath": "index",
+  "uses-permissions": [
+    "plugin.permission.FILE:READ",
+    "plugin.permission.FILE:WRITE",
+    "plugin.permission.FILE:DELETE"
+  ]
+}
